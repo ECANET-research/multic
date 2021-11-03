@@ -1,160 +1,145 @@
 import numpy as np
-from scipy.optimize import minimize
-from scipy.optimize import Bounds
-from scipy.special import logit
+from scipy.stats import spearmanr
 import networkx as nx
 import random
-import math
 import time
-import matplotlib.pyplot as plt
-from scipy.stats import spearmanr
-from sklearn.metrics import mean_absolute_error
-from sklearn.metrics import accuracy_score
-import torch
 import pickle
-import EoN
-import sys
-
-random.seed(0)
-np.random.seed(0)
-torch.manual_seed(0)
-
-np.set_printoptions(precision=1, suppress=True)
+from itertools import permutations
+from sklearn.metrics import mean_absolute_error, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve, auc
+import torch
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 overall_start_time = time.time()
-"""
-Read the user network
-"""
-N = 1000
-# N = 2000
-# N = 4000
-mu_in = 0
-sigma_in = 1
 
-K = 2
+"""
+Set Parameters
+"""
+# Network parameters
+N = 1000  # number of nodes
+K = 2  # number of layers
+overlap = 0  # layer overlap
+mu_in = 0.5  # mu parameter of the in-degree sequence
+
+# Spreading parameters
+T = 10  # ending time
+gamma = 2  # recovery rate
+epsilon_max = 0  # maximum layer mixing
+ratio = 16  # cascade-edge ratio
+
+# Single layer result processing parameters
+s_max_iter = 500  # maximum number of optimization iterations in the single layer phase
+E_ratio = 1.1  # ratio of number of inferred edges over ground-truth edges
+
+# Optimization parameters (multilayer phase)
+s_c = 8  # cascade size threshold for filtering out small cascades
+max_iter = 3000  # maximum number of optimization iterations
+min_iter = 100  # minimum number of optimization iterations
+learning_rate = 0.1  # initial learning rate of the Adam optimizer
+tol = 1/1000000  # threshold of relative objective value change for stopping the optimization
+
+
+"""
+Read Ground-Truth Parameter Values
+"""
 G_list = []
 for k in range(K):
-	G_list.append(nx.read_edgelist('networks/network_%d_%.1f_%d_%d.edgelist' % (N, mu_in, sigma_in, k), nodetype=int, create_using=nx.DiGraph))
+	G_list.append(nx.read_edgelist('networks/network_%d_%.1f_%d_%d_%.2f.edgelist' % (N, mu_in, K, k, overlap), nodetype=int, create_using=nx.DiGraph))
 
-alpha = np.zeros((N, N, K), dtype=np.float32)
-for k in range(K):
-	for e in G_list[k].edges:
-		alpha[e[0], e[1], k] = random.uniform(0.01, 1)
+with open('truth/alpha_%d_%.1f_%d_%.1f_%.2f.pkl' % (N, mu_in, K, epsilon_max, overlap), 'rb') as fp:
+	alpha = pickle.load(fp)
+with open('truth/pi_%d_%.1f_%d_%.1f_%.2f.pkl' % (N, mu_in, K, epsilon_max, overlap), 'rb') as fp:
+	pi = pickle.load(fp)
 
 alpha_agg = np.amax(alpha, axis=2)
 E = np.count_nonzero(alpha_agg)
-C_file = 500 * E
-
-pi = np.zeros((C_file, K))
-for c in range(C_file):
-	pi[c, random.choice(range(K))] = 1
+C_base = ratio * E
 
 
 """
-Set true parameters
+Conduct Three Runs of Inference with Different Seeds
 """
-T = 10
-t_threshold = 10
+for seed in [0, 1, 2]:
+	with open('truth/alpha_%d_%.1f_%d_%.1f_%.2f.pkl' % (N, mu_in, K, epsilon_max, overlap), 'rb') as fp:
+		alpha = pickle.load(fp)
+	with open('truth/pi_%d_%.1f_%d_%.1f_%.2f.pkl' % (N, mu_in, K, epsilon_max, overlap), 'rb') as fp:
+		pi = pickle.load(fp)
 
-# for gamma in [1, 2, 4, 8]:
-# for ratio in [16]:
-for rt_threshold in [8]:
-	for seed in [0, 1, 2]:
-		torch.cuda.empty_cache()
-		random.seed(seed)
-		np.random.seed(seed)
-		torch.manual_seed(seed)
+	random.seed(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
 
-# 		rt_threshold = 1
-		gamma = 2
-		ratio = 16
+	# Read single layer inference results
+	res_filename = 'results/s_%d_%d_%d_%d_%.1f_%.1f_%.2f_%d.pkl' % (N, E, C_base, K, gamma, epsilon_max, overlap, s_max_iter)
+	with open(res_filename, 'rb') as fp:
+		res_dict = pickle.load(fp)
+	succ_edges_list = res_dict['succ_edges_list']
+	alpha_inferred_nonzero = res_dict['alpha_inferred_nonzero']
 
-		C_base = ratio * E
+	# Rank the edges by inferred edge weight in the single layer phase
+	E_infer = int(E_ratio * E)
+	alpha_inferred_sorted = np.partition(alpha_inferred_nonzero, len(alpha_inferred_nonzero) - E_infer)
+	threshold = alpha_inferred_sorted[len(alpha_inferred_nonzero) - E_infer]  
+		# edge weight threshold above which there are <E_infer> edges
 
-		max_iter = 3000
-		learning_rate = 0.1
+	# Record the <E_infer> edges above the edge weight threshold
+	edge_set = set()
+	edge_list = []
+	nonzero_edges = {}
+	edge_cnt = 0
+	for cnt, e in enumerate(succ_edges_list):
+		if alpha_inferred_nonzero[cnt] >= threshold:
+			i = e // N
+			j = e % N
+			edge_set.add(e)
+			edge_list.append([i, j])
+			nonzero_edges[e] = edge_cnt
+			edge_cnt += 1
 
+	# Read spreading logs
+	log_filename = 'logs/logs_%d_%d_%d_%.1f_%.1f_%.2f.pkl' % (N, E, K, gamma, epsilon_max, overlap)
+	with open(log_filename, 'rb') as fp:
+		sim_data = pickle.load(fp)
 
-		"""
-		Read single-layer inference results
-		"""
-		res_filename = 'res/s_%d_%d_%d_%.1f_lik.pkl' % (N, E, C_base, gamma)
-		with open(res_filename, 'rb') as fp:
-			res_dict = pickle.load(fp)
+	# Recognize cascades of size above the cascades size threshold
+	data_nz = {}
+	C_idx = []
+	C_nz = 0
+	C = 0
+	for c in range(len(sim_data)):
+		sim_logs = sim_data[c]
+		if len(sim_logs) > 1:
+			C_nz += 1
+			if C_nz > C_base:
+				break
+			if len(sim_logs) > s_c:
+				data_nz[C] = sim_logs
+				C_idx.append(c)
+				C += 1
+	print('%d cascades out of %d above the cascade size threshold' % (C, C_base))
+	pi_nz = pi[C_idx, :]
 
-		succ_edges_list = res_dict['succ_edges_list']
-		alpha_inferred_nonzero = res_dict['alpha_inferred_nonzero']
-		E_infer = int(1.1 * E)
-		alpha_inferred_sorted = np.partition(alpha_inferred_nonzero, len(alpha_inferred_nonzero) - E_infer)
-		threshold = alpha_inferred_sorted[len(alpha_inferred_nonzero) - E_infer]
+	# Construct data tensors from cascades
+	mask_dict = {e: 0 for e in range(edge_cnt * C)}
+	time_dict = {e: 0 for e in range(edge_cnt * C)}
 
-		edge_set = set()
-		edge_list = []
-		nonzero_edges = {}
-		edge_cnt = 0
+	scatter_index_list = []
 
-		for cnt, e in enumerate(succ_edges_list):
-			if alpha_inferred_nonzero[cnt] >= threshold:
-				i = e // N
-				j = e % N
-				edge_set.add(e)
-				edge_list.append([i, j])
-				nonzero_edges[e] = edge_cnt
-				edge_cnt += 1
+	start_time = time.time()
+	for c in range(C):
+		if c % 500 == 0 and c != 0:
+			print('Finished parsing %d cascades' % c)
+		sim_logs = data_nz[c]
 
-		print(edge_cnt)
+		for e in edge_list:
+			scatter_index_list.append(e[1] * C + c)
 
-		# Recognize nonzero cascades
-		log_filename = 'logs/logs_%d_%d_%.1f.pkl' % (N, E, gamma)
-		with open(log_filename, 'rb') as fp:
-			sim_data = pickle.load(fp)
+		succ_users = set()
+		fail_users = set(range(N))
 
-		data_nz = {}
-		C_idx = []
-		C_nz = 0
-		C = 0
-		C_real = len(sim_data)
-	# 	filter_threshold = 16
-	# 	C_filter_idx = []
-		for c in range(C_real):
-			sim_logs = sim_data[c]
-			if len(sim_logs) > 1:
-				C_nz += 1
-				if C_nz > C_base:
+		for (t, u, j) in sim_logs:
+			if j in fail_users:
+				if t > T:
 					break
-				if len(sim_logs) > rt_threshold:
-					data_nz[C] = sim_logs
-					C_idx.append(c)
-					C += 1
-	# 			if len(sim_logs) > filter_threshold:
-	# 				C_filter_idx.append(C_nz)
-		print('%d cascades out of %d above the RT threshold' % (C, C_file))
-		pi_nz = pi[C_idx, :]
-
-
-		"""
-		Parse simulated logs
-		"""
-		mask_dict = {e: 0 for e in range(edge_cnt * C)}
-		time_dict = {e: 0 for e in range(edge_cnt * C)}
-
-		scatter_index_list = []
-
-		start_time = time.time()
-		for c in range(C):
-			if c % 500 == 0:
-				print('Cascade %d' % c)
-			sim_logs = data_nz[c]
-
-			for e in edge_list:
-				scatter_index_list.append(e[1] * C + c)
-
-			succ_users = set()
-			fail_users = set(range(N))
-
-			for (t, u, j) in sim_logs:
 				for (u, t_u) in succ_users:
 					e = N * u + j
 					if e in edge_set:
@@ -164,146 +149,202 @@ for rt_threshold in [8]:
 				succ_users.add((j, t))
 				fail_users.remove(j)
 
-			for (j, t_j) in succ_users:
-				for n in fail_users:
-					e = N * j + n
-					if e in edge_set:
-						idx = c * edge_cnt + nonzero_edges[e]
-						time_dict[idx] += T - t_j
+		for (j, t_j) in succ_users:
+			for n in fail_users:
+				e = N * j + n
+				if e in edge_set:
+					idx = c * edge_cnt + nonzero_edges[e]
+					time_dict[idx] += T - t_j
 
-		end_time = time.time()
-		parse_time = end_time - start_time
+	end_time = time.time()
+	parse_time = end_time - start_time
 
+	start_time = time.time()
+	mask = torch.tensor(list(mask_dict.values()), dtype=torch.uint8).view(C, edge_cnt).to(device)
+	delta_t = torch.tensor(list(time_dict.values())).view(C, edge_cnt).to(device)
+	scatter_index = torch.tensor(scatter_index_list, dtype=torch.int64).to(device)
+	end_time = time.time()
+	tensor_time = end_time - start_time
+
+	print('Finished data parsing and tensor construction\n\nStarting optimization')
+
+
+	"""
+	Conduct Inference
+	"""
+	# Define objective function
+	def objective(params):
+		alpha_p = torch.sigmoid(params[:edge_cnt * K]).view(K, edge_cnt)
+		pi_list = []
+		for k in range(K - 1):
+			pi_rm = 1
+			for i in range(k):
+				pi_rm -= pi_list[i]
+			pi_list.append(torch.sigmoid(params[(edge_cnt * K + C * k):(edge_cnt * K + C * (k + 1))]) * pi_rm)
+		pi_rm = 1
+		for pi in pi_list:
+			pi_rm -= pi
+		pi_list.append(pi_rm)
+		pi_p = torch.stack(pi_list, dim=-1).to(device)
+
+		alpha_pi_prod = torch.matmul(pi_p, alpha_p)
+
+		H = torch.zeros(N * C, dtype=torch.double).to(device).scatter_add_(0, scatter_index, torch.flatten(mask * alpha_pi_prod))
+		H_nonzero = H[H != 0]
+
+		return torch.sum(delta_t * alpha_pi_prod) - torch.sum(torch.log(H_nonzero))
+
+
+	# Initialize parameters
+	params_init = np.random.uniform(-5, 5, size=(edge_cnt * K + C * (K - 1)))
+	params_g = torch.tensor(params_init, requires_grad=True, device=device)
+
+	# Initialize optimizer
+	opt = torch.optim.Adam([params_g], lr=learning_rate)
+
+	infer_time = 0
+	eval_time = 0
+
+	lik_list = []
+	pi_acc_list = []
+	orders = list(permutations(range(K)))
+
+	# Conduct optimization
+	for i in range(max_iter):
+		# Calculate objective
 		start_time = time.time()
-		mask = torch.tensor(list(mask_dict.values()), dtype=torch.uint8).view(C, edge_cnt).to(device)
-		delta_t = torch.tensor(list(time_dict.values())).view(C, edge_cnt).to(device)
-		# H_index = torch.tensor(H_index_list).to(device)
-		scatter_index = torch.tensor(scatter_index_list, dtype=torch.int64).to(device)
+		loss = objective(params_g)
+		loss_val = loss.item()
+		lik_list.append(loss_val)
 		end_time = time.time()
-		tensor_time = end_time - start_time
+		infer_time += end_time - start_time
 
-		print('Data parsing time for %d nodes, %d edges, %d items: %.2fs' % (N, E, C, parse_time))
-		print('Tensor construction time for %d nodes, %d edges, %d items: %.2fs' % (N, E, C, tensor_time))
+		print('Iteration %d loss: %.4f' % (i, loss_val))
+		if len(lik_list) >= 2 and (lik_list[-2] - lik_list[-1]) / lik_list[-2] < tol:
+			break
 
+		# Parse inferred pi values
+		start_time = time.time()
+		alpha_inferred = torch.sigmoid(params_g[:edge_cnt * K]).view(K, edge_cnt).cpu().detach().numpy().T
+		pi_list = []
+		for k in range(K - 1):
+			pi_rm = 1
+			for i in range(k):
+				pi_rm -= pi_list[i]
+			pi_list.append(torch.sigmoid(params_g[(edge_cnt * K + C * k):(edge_cnt * K + C * (k + 1))]).cpu().detach() * pi_rm)
+		pi_rm = 1
+		for pi in pi_list:
+			pi_rm -= pi
+		pi_list.append(pi_rm)
+		pi_inferred = torch.stack(pi_list, dim=-1)
 
-		"""
-		Conduct inference
-		"""
-		def objective(params):
-			alpha_p = torch.sigmoid(params[:edge_cnt * K]).view(K, edge_cnt)
-			pi_sl = torch.sigmoid(params[edge_cnt * K:])
-			pi_p = torch.stack((pi_sl, 1 - pi_sl), dim=-1)
+		# Evaluate pi accuracy
+		acc_pi_best = 0
+		for order in orders:  # enumerate possible orders of layers
+			acc_pi = accuracy_score(np.argmax(pi_inferred[:, order], axis=1), np.argmax(pi_nz, axis=1))
+			if acc_pi > acc_pi_best:
+				acc_pi_best = acc_pi
+		print('Pi accuracy: %.4f' % acc_pi_best)
+		pi_acc_list.append(acc_pi_best)
+		end_time = time.time()
+		eval_time += end_time - start_time
 
-			alpha_pi_prod = torch.matmul(pi_p, alpha_p)
+		# Loss propagation
+		start_time = time.time()
+		opt.zero_grad()
+		loss.backward()
+		opt.step()
+		end_time = time.time()
+		infer_time += end_time - start_time
 
-			H = torch.zeros(N * C, dtype=torch.double).to(device).scatter_add_(0, scatter_index, torch.flatten(mask * alpha_pi_prod))
-			H_nonzero = H[H != 0]
+	# Prepare for alpha accuracy evaluation:
+	# for each layer, recognize cascades that spread on it and remove edges that are not activated by these cascades
+	start_time = time.time()
+	pi_b = torch.argmax(pi_inferred, dim=1).numpy()
 
-			return torch.sum(delta_t * alpha_pi_prod) - torch.sum(torch.log(H_nonzero))
+	c_cluster = {k:set() for k in range(K)}
+	for c in range(C):
+		c_cluster[pi_b[c]].add(c)
 
+	nz_edges_l = {k:set() for k in range(K)}
+	for k in range(K):
+		for c in c_cluster[k]:
+			sim_logs = data_nz[c]
+			sim_logs.sort()
 
-		# Initialize parameters
-		params_init = np.random.uniform(-5, 5, size=(edge_cnt * K + C))
-		params_g = torch.tensor(params_init, requires_grad=True, device=device)
+			succ_users = set()
+			fail_users = set(range(N))
 
-		# opt = torch.optim.SGD([params_g], lr=learning_rate)
-		opt = torch.optim.Adam([params_g], lr=learning_rate)
+			for (t, u, j) in sim_logs:
+				if j in fail_users:
+					if t > T:
+						break
+					for (u, t_u) in succ_users:
+						e = N * u + j
+						if e in edge_set:
+							nz_edges_l[k].add(e)
+					succ_users.add((j, t))
+					fail_users.remove(j)
 
-		infer_time = 0
-		eval_time = 0
+	alpha_inferred_nonzero = torch.sigmoid(params_g[:(edge_cnt * K)]).view(K, edge_cnt).cpu().detach().numpy().T
+	alpha_inferred = np.zeros((N, N, K))
+	for k in range(K):
+		for e in nz_edges_l[k]:
+			i = e // N
+			j = e % N
+			alpha_inferred[i, j, k] = alpha_inferred_nonzero[nonzero_edges[e], k]
 
-		alpha_nonzero = np.zeros((edge_cnt, K))
-		for e in edge_list:
-			alpha_nonzero[nonzero_edges[e[0] * N + e[1]], :] = alpha[e[0], e[1], :]
+	# Calculate metrics of alpha accuracy
+	mae_best = 100
+	ae_best = 100
+	corr_best = -1
+	roc_auc_best = 0
+	prc_auc_best = 0
+	order_best = None
 
-		lik_list = []
-		alpha_corr_list = []
-		alpha_mae_list = []
-		pi_corr_list = []
-		pi_mae_list = []
-		pi_acc_list = []
-		for i in range(max_iter):
-			start_time = time.time()
-			loss = objective(params_g)
-			loss_val = loss.item()
-			lik_list.append(loss_val)
-			print('Iteration %d loss: %.4f' % (i, loss_val))
-			if len(lik_list) >= 2 and (lik_list[-2] - lik_list[-1]) / lik_list[-2] < 1/1000000:
-				break
-			end_time = time.time()
-			infer_time += end_time - start_time
+	alpha_nz_idx = np.nonzero(alpha)
+	a_true = alpha[alpha_nz_idx]
+	y_true = np.where(alpha > 0, 1, 0).flatten()
+	for order in orders:
+		alpha_inferred_swap = alpha_inferred[:, :, order]
+		a_pred = alpha_inferred_swap[alpha_nz_idx]
+		ae = np.absolute(a_pred - a_true)
+		mae = np.mean(ae / a_true)
+		corr, _ = spearmanr(a_pred, a_true)
+		roc_auc = roc_auc_score(y_true, alpha_inferred_swap.flatten())
+		pr_all, re_all, _ = precision_recall_curve(y_true, alpha_inferred_swap.flatten())
+		prc_auc = auc(re_all, pr_all)
+		if prc_auc > prc_auc_best:
+			mae_best = mae
+			ae_best = np.mean(ae)
+			corr_best = corr
+			roc_auc_best = roc_auc
+			prc_auc_best = prc_auc
+			order_best = order
 
-		# 	if i % 20 == 0:
-			start_time = time.time()
-			alpha_inferred = torch.sigmoid(params_g[:edge_cnt * K]).view(K, edge_cnt).cpu().detach().numpy().T
-			pi_inferred_sl = torch.sigmoid(params_g[edge_cnt * K:]).cpu().detach().numpy()
-			pi_inferred = np.stack((pi_inferred_sl, 1 - pi_inferred_sl), axis=-1)
-			pi_inferred_b = np.where(pi_inferred > 0.5, 1, 0)
+	print('Alpha MAE: %.4f' % ae_best)
+	print('Alpha normalized MAE: %.4f' % mae_best)
+	print('Alpha correlation: %.8f' % corr_best)
+	print('Alpha AUC (ROC): %.8f' % roc_auc_best)
+	print('Alpha AUC (PRC): %.8f' % prc_auc_best)
+	print()
 
-			alpha_inferred_swap = alpha_inferred[:, [1, 0]]
-			r1_nz_alpha, p1_nz_alpha = spearmanr(alpha_inferred, alpha_nonzero, axis=None)
-			r2_nz_alpha, p2_nz_alpha = spearmanr(alpha_inferred_swap, alpha_nonzero, axis=None)
-			mae1_nz_alpha = mean_absolute_error(alpha_inferred.flatten(), alpha_nonzero.flatten())
-			mae2_nz_alpha = mean_absolute_error(alpha_inferred_swap.flatten(), alpha_nonzero.flatten())
+	end_time = time.time()
+	eval_time += end_time - start_time
 
-			r1_pi, p1_pi = spearmanr(pi_inferred_b[:, 0], pi_nz[:, 0], axis=None)
-			r2_pi, p2_pi = spearmanr(pi_inferred_b[:, 1], pi_nz[:, 0], axis=None)
-			mae1_pi = mean_absolute_error(pi_inferred[:, 0], pi_nz[:, 0])
-			mae2_pi = mean_absolute_error(pi_inferred[:, 1], pi_nz[:, 0])
-			acc1_pi = accuracy_score(np.argmax(pi_inferred_b, axis=1), np.argmax(pi_nz, axis=1))
-			acc2_pi = accuracy_score(np.argmax(pi_inferred_b[:, [1, 0]], axis=1), np.argmax(pi_nz, axis=1))
-
-		# 	acc1_pi_filter = accuracy_score(np.argmax(pi_inferred_b[C_filter_idx, :], axis=1), np.argmax(pi_nz[C_filter_idx, :], axis=1))
-		# 	pi_inferred_b_rv = pi_inferred_b[:, [1, 0]]
-		# 	acc2_pi_filter = accuracy_score(np.argmax(pi_inferred_b_rv[C_filter_idx, :], axis=1), np.argmax(pi_nz[C_filter_idx, :], axis=1))
-
-			print('Non-zero alpha correlation: %.4f' % max(r1_nz_alpha, r2_nz_alpha))
-			alpha_corr_list.append(max(r1_nz_alpha, r2_nz_alpha))
-			print('Pi correlation: %.4f' % max(r1_pi, r2_pi))
-			pi_corr_list.append(max(r1_pi, r2_pi))
-			print('Non-zero alpha MAE: %.4f' % max(mae1_nz_alpha, mae2_nz_alpha))
-			alpha_mae_list.append(max(mae1_nz_alpha, mae2_nz_alpha))
-			print('Pi MAE: %.4f' % min(mae1_pi, mae2_pi))
-			pi_mae_list.append(min(mae1_pi, mae2_pi))
-			print('Pi accuracy: %.4f' % max(acc1_pi, acc2_pi))
-		# 	print('Filtered pi accuracy: %.4f' % max(acc1_pi_filter, acc2_pi_filter))
-			pi_acc_list.append(max(acc1_pi, acc2_pi))
-			end_time = time.time()
-			eval_time += end_time - start_time
-		# 	if len(pi_acc_list) >= 2 and pi_acc_list[-1] < pi_acc_list[-2]:
-		# 		break
-
-			start_time = time.time()
-			opt.zero_grad()
-			loss.backward()
-			opt.step()
-		# 	torch.cuda.empty_cache()
-			end_time = time.time()
-			infer_time += end_time - start_time
-
-		print('Cuda memory allocated: %.4f' % torch.cuda.memory_allocated())
-		print('Max cuda memory allocated: %.4f' % torch.torch.cuda.max_memory_allocated())
-
-		params_truth = torch.tensor(np.concatenate([logit(alpha_nonzero.T).flatten(), logit(pi_nz[:, 0]).flatten()]), device=device)
-		true_lik = objective(params_truth).item()
-
-		print()
-		print('Ground truth likelihood: %.4f' % true_lik)
-		print('Likelihood error ratio: %.5f' % (abs(true_lik - loss_val) / true_lik))
-		print()
-
-		print('Optimization time for %d nodes, %d edges, %d items, gamma=%.1f: %ds for inference, %ds for evaluation' % (N, E, C, gamma, infer_time, eval_time))
-
-		res_dict = {}
-		res_dict['acc'] = {'alpha_corr': alpha_corr_list, 'alpha_mae': alpha_mae_list, 'pi_corr': pi_corr_list, 'pi_mae': pi_mae_list, 'pi_acc': pi_acc_list}
-		res_dict['lik'] = lik_list
-		res_dict['true_lik'] = true_lik
-		res_dict['time'] = {'parse': parse_time, 'tensor': tensor_time, 'infer': infer_time, 'eval': eval_time}
+	print('Optimization time for N=%d, K=%d, overlap=%.2f, mu_in=%.1f, E=%d, C=%d, gamma=%d, epsilon_max=%.1f, s_c=%d: %ds for data parsing, %ds for tensor construction, %ds for inference, %ds for evaluation' % (N, K, overlap, mu_in, E, C, gamma, epsilon_max, s_c, parse_time, tensor_time, infer_time, eval_time))
+	
+	# Save results to file
+	res_dict = {}
+	res_dict['acc'] = {'pi_acc': pi_acc_list, 'alpha_corr': corr_best, 'alpha_mae': ae_best, 'alpha_nmae': mae_best, 'alpha_roc_auc': roc_auc_best, 'alpha_prc_auc': prc_auc_best}
+	res_dict['lik'] = lik_list
+	res_dict['time'] = {'parse': parse_time, 'tensor': tensor_time, 'infer': infer_time, 'eval': eval_time}
+	if torch.cuda.is_available():
 		res_dict['memory'] = torch.torch.cuda.max_memory_allocated()
 
-		res_filename = 'res/m_%d_%d_%d_%.1f_%d_%d_lik.pkl' % (N, E, C_base, gamma, rt_threshold, seed)
-		with open(res_filename, 'wb') as fp:
-			pickle.dump(res_dict, fp)
+	res_filename = 'results/m_%d_%d_%d_%d_%.1f_%d_%.1f_%.2f_%d_%d.pkl' % (N, E, K, C_base, gamma, s_c, epsilon_max, overlap, seed, s_max_iter)
+	with open(res_filename, 'wb') as fp:
+		pickle.dump(res_dict, fp)
 
 overall_end_time = time.time()
 print('Overall runtime: %.2fs' % (overall_end_time - overall_start_time))
