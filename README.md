@@ -1,5 +1,5 @@
 # MultiC
-This repository contains the code for producing the results we reported in [*Applicability of Multilayer Diffusion Network Inference to Social Media Data*](https://arxiv.org/abs/2111.06235), a paper where we studied the method of inferring multilayer diffusion networks from the spreading logs of items (e.g., tweets, hashtags, news articles). In the paper, we first introduced a novel implementation of the method, *MultiC*, that achieves high efficiency and accuracy using GPU computing. Then, we conducted synthetic data experiments to explore how the inference accuracy of the method varies across a range of realistic network structure and information spreading settings. 
+This repository contains the code for producing the results we reported in *Limits of Multilayer Diffusion Network Inference in Social Media Research* (to appear in ICWSM 2022), a paper where we studied the method of inferring multilayer diffusion networks from the spreading logs of items (e.g., tweets, hashtags, news articles). In the paper, we first introduced a novel implementation of the method, *MultiC*, that achieves high efficiency and accuracy using GPU computing. Then, we conducted synthetic data experiments to explore how the inference accuracy of the method varies across a range of realistic network structure and information spreading settings. 
 
 We provide here the code we used for i) generating the synthetic multilayer diffusion networks, ii) generating the synthetic spreading logs of items, and iii) conducting the diffusion network inference. The data generation and inference processes can be easily personalized by setting different parameter values, as we will elaborate below.
 
@@ -48,12 +48,4 @@ The multilayer inference finishes 3 independent runs in roughly 8 minutes with m
 8. Please contact [me](mailto:yan.xia@aalto.fi) if you have any other problem with using the code, or any suggestion of improvement.
 
 ## Citation
-Please cite the following paper if you are using this code:
-```
-@article{xia2021applicability,
-  title={Applicability of Multilayer Diffusion Network Inference to Social Media Data},
-  author={Xia, Yan and Chen, Ted Hsuan Yun and Kivel{\"a}, Mikko},
-  journal={arXiv preprint arXiv:2111.06235},
-  year={2021}
-}
-```
+To appear.
